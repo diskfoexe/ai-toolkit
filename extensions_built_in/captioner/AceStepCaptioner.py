@@ -133,7 +133,7 @@ class AceStepCaptioner(BaseCaptioner):
         self.model2 = None
         self.processor2 = None
 
-        if self.caption_config.fixed_caption is not None:
+        if self.caption_config.fixed_caption is None:
             # load captioner model
             self.print_and_status_update("Loading captioner model")
             self.model2 = Qwen2_5OmniForConditionalGeneration.from_pretrained(
@@ -191,7 +191,7 @@ class AceStepCaptioner(BaseCaptioner):
         return result.strip()
 
     def get_audio_lyrics(self, audio_data: torch.Tensor) -> str:
-        if self.caption_config.low_vram and self.model2.device != torch.device("cpu"):
+        if self.caption_config.low_vram and self.model2 is not None and self.model2.device != torch.device("cpu"):
             # move captioner to cpu
             self.model2.to("cpu")
         # move lyric model if needed
