@@ -32,7 +32,7 @@ from toolkit.models.base_model import BaseModel
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
-from toolkit.util.quantize import quantize, get_qtype, quantize_model
+from toolkit.util.quantize import quantize, get_qtype
 
 from .src.model import ExampleTransformer2DModel
 from .src.pipeline import ExamplePipeline, pad_prompt_embeds
@@ -55,6 +55,11 @@ class ExampleModel(BaseModel):
     #    (resolved by toolkit/util/get_model.py:get_model_class)
     #  - it is the default cache key for text-embedding / latent caches
     arch = "example"
+
+    # ALL NEW MODELS should set this to False. ``BaseModel`` defaults it to True
+    # only for backwards-compatibility with already-released LoKr checkpoints; the
+    # newer LoKr weight format is the correct one for any new architecture.
+    use_old_lokr_format = False
 
     def __init__(
         self,
@@ -160,21 +165,14 @@ class ExampleModel(BaseModel):
         del state_dict
         flush()  # gc + empty cuda cache; call it after dropping anything big
 
-        if self.model_config.quantize:
-            # quantize_model handles qtype selection, exclusions and device
-            # juggling, and leaves the model on CPU
-            self.print_and_status_update("Quantizing transformer")
-            quantize_model(self, transformer)
-            flush()
-
-        if self.model_config.low_vram:
-            # leave it on CPU; get_noise_prediction moves it over when needed
-            transformer.to("cpu")
-        else:
-            transformer.to(self.device_torch, dtype=dtype)
+        # quantize + offload + placement, all driven by model_config:
+        # component_load_kwargs derives qtype (incl. an accuracy recovery
+        # adapter), the layer-offload fraction and the target device
+        # (low_vram parks on CPU); aitk_post_load applies them. Models whose
+        # checkpoint sourcing is standard can collapse the build + this into
+        # one call: ExampleTransformer2DModel.load(path, **kwargs).
+        transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
         flush()
-        # For partial layer offloading support see MemoryManager.attach usage
-        # in ../ideogram4/ideogram4.py or ../z_image/z_image.py.
 
         # --- text encoder + tokenizer (stock transformers model) ---
         self.print_and_status_update("Loading text encoder")
@@ -329,6 +327,15 @@ class ExampleModel(BaseModel):
              prompt, each at its natural (unpadded) length. Padding to the
              batch max is deferred to get_noise_prediction / the pipeline,
              which keeps caches small and lets any prompts share a batch.
+
+             Each per-prompt tensor MUST be 2D ``(L, D)`` -- BaseModel infers the
+             text batch size from the list and only treats it as one-per-prompt
+             when the tensors are 2D; a 3D per-prompt tensor is misread as an
+             already-batched ``(B, L, D)`` and training fails with a latents-vs-
+             text batch-size mismatch. If your conditioning has an extra axis
+             (e.g. N stacked encoder layers -> ``(L, N, D)``), flatten it here
+             (``(L, N*D)``) and restore it (``reshape(B, Lt, N, D)``) at the
+             model call.
 
              You can store any number of keys (pooled embeds, image features,
              ...). If a key must keep its dtype when everything else is cast
@@ -490,19 +497,8 @@ class ExampleModel(BaseModel):
         attribute in src/model.py."""
         return ["blocks"]
 
-    def convert_lora_weights_before_save(self, state_dict):
-        """Map internal LoRA keys to the ecosystem-standard naming right before
-        the .safetensors is written. Most modern models ship LoRAs with a
-        ``diffusion_model.`` prefix (ComfyUI convention); internally ai-toolkit
-        uses ``transformer.``."""
-        return {
-            k.replace("transformer.", "diffusion_model."): v
-            for k, v in state_dict.items()
-        }
+    # LoRA keys save with the ecosystem-standard ``diffusion_model.`` prefix
+    # (ComfyUI convention) and load back to the internal ``transformer.``
+    # prefix; see BaseModel.convert_lora_weights_before_save/load
+    lora_keys_use_comfy_prefix = True
 
-    def convert_lora_weights_before_load(self, state_dict):
-        """Inverse of the above, applied when resuming from a saved LoRA."""
-        return {
-            k.replace("diffusion_model.", "transformer."): v
-            for k, v in state_dict.items()
-        }
